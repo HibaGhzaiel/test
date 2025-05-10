@@ -1,0 +1,215 @@
+name: Frontend CI
+
+on: 
+  push:
+    branches:
+      - hiba
+
+jobs:
+  sonar-sast:
+    name: SAST - SonarQube (Node.js)
+    runs-on: ubuntu-latest
+    outputs:
+      sast_status: ${{ steps.check-status.outputs.sast_passed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 16 
+
+      - name: Install dependencies
+        run: |
+          cd weather_app_frontend
+          npm install
+          
+      - name: SonarQube Scan
+        id: sonar_scan
+        uses: sonarsource/sonarqube-scan-action@master
+        with:
+          args: >
+            -Dsonar.projectKey=weather_app_frontend
+            -Dsonar.projectBaseDir=weather_app_frontend/src
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Wait for SonarQube analysis to complete
+        run: |
+          echo "Waiting for SonarQube analysis to complete..."
+          for i in {1..12}; do
+            analysis_status=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" "${{ secrets.SONAR_HOST_URL }}/api/qualitygates/project_status?projectKey=weather_app_frontend")
+            passed=$(echo $analysis_status | jq -r '.projectStatus.status')
+            echo "Current status: $passed"
+            if [[ "$passed" == "OK" ]]; then
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Check SonarQube analysis status
+        id: check-status
+        run: |
+          analysis_status=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" "${{ secrets.SONAR_HOST_URL }}/api/qualitygates/project_status?projectKey=weather_app_frontend")
+          echo "Status: $analysis_status"
+          passed=$(echo $analysis_status | jq -r '.projectStatus.status')
+          if [[ "$passed" != "OK" ]]; then
+            echo "sast_passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "sast_passed=true" >> $GITHUB_OUTPUT
+
+  build: 
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: sonar-sast
+    if: needs.sonar-sast.outputs.sast_status == 'true'
+    outputs:
+      image_tag: ${{ steps.save-image.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Get short commit ID
+        id: get_commit_id
+        run: |
+          COMMIT_ID=$(git rev-parse --short HEAD)
+          echo "COMMIT_ID=$COMMIT_ID" >> $GITHUB_ENV
+
+      - name: Build frontend image
+        run: |
+          cd weather_app_frontend
+          docker build -t dev_frontend:${{ env.COMMIT_ID }} .
+
+      - name: Save Docker image
+        id: save-image
+        run: |
+          docker save dev_frontend:${{ env.COMMIT_ID }} -o dev_frontend_${{ env.COMMIT_ID }}.tar
+          echo "image_tag=${{ env.COMMIT_ID }}" >> $GITHUB_OUTPUT
+          
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev_frontend
+          path: dev_frontend_${{ env.COMMIT_ID }}.tar
+
+  dast:
+    name: DAST - Trivy & OWASP ZAP
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: dev_frontend
+          path: ./ 
+
+      - name: Load Docker image
+        run: docker load -i dev_frontend_${{ needs.build.outputs.image_tag }}.tar
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update && sudo apt-get install -y wget
+          wget https://github.com/aquasecurity/trivy/releases/download/v0.50.1/trivy_0.50.1_Linux-64bit.tar.gz
+          tar zxvf trivy_0.50.1_Linux-64bit.tar.gz
+          sudo mv trivy /usr/local/bin/
+          trivy --version
+
+      - name: Run Trivy Scan (HTML Report)
+        run: |
+          mkdir -p /tmp/trivy-templates
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o /tmp/trivy-templates/html.tpl
+          trivy image --scanners vuln,secret --format template --template "@/tmp/trivy-templates/html.tpl" --output trivy-report.html dev_frontend:${{ needs.build.outputs.image_tag }}
+
+      - name: Upload Trivy HTML Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-html-report
+          path: trivy-report.html
+
+      - name: Install OWASP Dependency-Check
+        run: |
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.0/dependency-check-8.4.0-release.zip
+          unzip dependency-check-8.4.0-release.zip
+          sudo mv dependency-check /usr/local/bin/
+
+      - name: Run OWASP Dependency-Check on frontend
+        run: |
+          /usr/local/bin/dependency-check/bin/dependency-check.sh \
+            --project "Weather App Frontend" \
+            --scan ./weather_app_frontend \
+            --format HTML \
+            --out dependency-check-report-frontend.html
+
+      - name: Upload Dependency-Check HTML Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report-frontend
+          path: dependency-check-report-frontend.html
+
+      - name: Run frontend container
+        run: |
+          docker run -d --name frontend_test -p 4200:4200 \
+            dev_frontend:${{ needs.build.outputs.image_tag }}
+          sleep 10
+
+      - name: Run ZAP scan
+        run: |
+          mkdir -p results/zap
+          chmod -R 777 ${{ github.workspace }}/results/zap
+          docker run --network=host -v ${{ github.workspace }}/results/zap:/zap/wrk/:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://localhost:4200 \
+            -r zap_report.html \
+            -J zap_report.json
+        continue-on-error: true
+
+      - name: Stop and remove container
+        run: docker stop frontend_test && docker rm frontend_test
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: ${{ github.workspace }}/results/zap/
+          
+      - name: Check ZAP High Risk Vulnerabilities
+        id: check_zap
+        run: |
+          high_alerts=$(jq '[.site[].alerts[] | select(.risk == "High")] | length' results/zap/zap_report.json)
+          echo "High risk vulnerabilities found: $high_alerts"
+          if [ "$high_alerts" -gt 0 ]; then
+            echo "High risk vulnerabilities detected! Failing..."
+            exit 1
+          fi
+
+  push:
+    name: Push to GHCR
+    runs-on: ubuntu-latest
+    needs: [dast, build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: dev_frontend
+          path: ./ 
+
+      - name: Load Docker image
+        run: docker load -i dev_frontend_${{ needs.build.outputs.image_tag }}.tar
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.TOKEN_GITHUB_GITOPS }}" | docker login ghcr.io -u iovision-io --password-stdin
+
+      - name: Tag and push Docker image
+        run: |
+          docker tag dev_frontend:${{ needs.build.outputs.image_tag }} ghcr.io/iovision-io/intern_gitops_dev_frontend:${{ needs.build.outputs.image_tag }}
+          docker tag dev_frontend:${{ needs.build.outputs.image_tag }} ghcr.io/iovision-io/intern_gitops_dev_frontend:latest
+          docker push ghcr.io/iovision-io/intern_gitops_dev_frontend:${{ needs.build.outputs.image_tag }}
+          docker push ghcr.io/iovision-io/intern_gitops_dev_frontend:latest
